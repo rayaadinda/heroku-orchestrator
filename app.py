@@ -6,6 +6,7 @@ import boto3
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+import requests
 
 app = FastAPI(title="DoctorTool OCR Self-Learning Orchestrator", version="2.0.0")
 
@@ -17,6 +18,9 @@ R2_PUBLIC_BASE_URL = os.environ.get(
     "R2_PUBLIC_BASE_URL", "https://pub-8b3cc4a8d5ff4365b18471f08bb797cb.r2.dev"
 )
 WORKER_SHARED_SECRET = os.environ.get("WORKER_SHARED_SECRET", "doctortool-colab-worker-secret-2026")
+MODAL_WEBHOOK_URL = os.environ.get("MODAL_WEBHOOK_URL", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "rayaadinda/heroku-orchestrator")
 
 QUEUE_OBJECT_KEY = "jobs/calibration_queue.json"
 MANIFEST_OBJECT_KEY = "models/latest.json"
@@ -80,6 +84,36 @@ class WorkerCompleteJobRequest(BaseModel):
     stage2: Optional[WorkerCompleteSlotPayload] = None
 
 
+def dispatch_training_worker(job_entry: dict):
+    if MODAL_WEBHOOK_URL:
+        try:
+            requests.post(MODAL_WEBHOOK_URL, json=job_entry, timeout=5)
+            return True
+        except Exception as e:
+            print("Modal dispatch failed:", e)
+
+    if GITHUB_TOKEN:
+        try:
+            resp = requests.post(
+                f"https://api.github.com/repos/{GITHUB_REPO}/dispatches",
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "doctortool-orchestrator",
+                },
+                json={
+                    "event_type": "run_calibration_training",
+                    "client_payload": job_entry,
+                },
+                timeout=5,
+            )
+            return resp.status_code in [200, 204]
+        except Exception as e:
+            print("GitHub dispatch failed:", e)
+
+    return False
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "doctortool-ocr-orchestrator", "timestamp": int(time.time() * 1000)}
@@ -89,13 +123,27 @@ def health_check():
 def register_calibration_job(req: RegisterCalibrationRequest):
     queue_data = read_r2_json(QUEUE_OBJECT_KEY, {"jobs": []})
     existing_ids = {j["id"] for j in queue_data["jobs"]}
+    job_entry = req.model_dump()
     if req.id not in existing_ids:
-        job_entry = req.model_dump()
         job_entry["status"] = "QUEUED"
         job_entry["queuedAt"] = int(time.time() * 1000)
         queue_data["jobs"].append(job_entry)
         write_r2_json(QUEUE_OBJECT_KEY, queue_data)
-    return {"ok": True, "jobId": req.id, "queuedCount": len([j for j in queue_data["jobs"] if j["status"] == "QUEUED"])}
+
+    dispatched = dispatch_training_worker(job_entry)
+
+    return {
+        "ok": True,
+        "jobId": req.id,
+        "dispatchedWorker": dispatched,
+        "queuedCount": len([j for j in queue_data["jobs"] if j["status"] == "QUEUED"]),
+    }
+
+
+@app.get("/api/v1/models/latest")
+def get_latest_models():
+    manifest = read_r2_json(MANIFEST_OBJECT_KEY, {})
+    return manifest
 
 
 @app.get("/api/v1/worker/pending-jobs")
@@ -115,10 +163,15 @@ def complete_training_job(req: WorkerCompleteJobRequest, x_worker_token: str = H
     manifest = read_r2_json(MANIFEST_OBJECT_KEY, {})
     now_ms = int(time.time() * 1000)
 
+    if "data" not in manifest or not isinstance(manifest["data"], dict):
+        manifest["data"] = {"updateAvailable": True, "serverTimestamp": now_ms, "models": {}}
+    if "models" not in manifest["data"]:
+        manifest["data"]["models"] = {}
+
     if req.stage1:
         if req.stage1.map50 < 0.80:
             raise HTTPException(status_code=422, detail=f"Stage 1 mAP50 ({req.stage1.map50:.3f}) below safety gate 0.80")
-        manifest["stage1_device_roi"] = {
+        stage1_dict = {
             "slot": "stage1_device_roi",
             "version": req.stage1.version,
             "clinicScope": "global",
@@ -130,11 +183,13 @@ def complete_training_job(req: WorkerCompleteJobRequest, x_worker_token: str = H
             "labels": req.stage1.labels,
             "updatedAt": now_ms,
         }
+        manifest["stage1_device_roi"] = stage1_dict
+        manifest["data"]["models"]["stage1_device_roi"] = stage1_dict
 
     if req.stage2:
         if req.stage2.map50 < 0.80:
             raise HTTPException(status_code=422, detail=f"Stage 2 mAP50 ({req.stage2.map50:.3f}) below safety gate 0.80")
-        manifest["stage2_digit_7seg"] = {
+        stage2_dict = {
             "slot": "stage2_digit_7seg",
             "version": req.stage2.version,
             "clinicScope": "global",
@@ -146,8 +201,12 @@ def complete_training_job(req: WorkerCompleteJobRequest, x_worker_token: str = H
             "labels": req.stage2.labels,
             "updatedAt": now_ms,
         }
+        manifest["stage2_digit_7seg"] = stage2_dict
+        manifest["data"]["models"]["stage2_digit_7seg"] = stage2_dict
 
     manifest["updatedAt"] = now_ms
+    manifest["data"]["serverTimestamp"] = now_ms
+    manifest["data"]["updateAvailable"] = True
     write_r2_json(MANIFEST_OBJECT_KEY, manifest)
 
     queue_data = read_r2_json(QUEUE_OBJECT_KEY, {"jobs": []})

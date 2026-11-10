@@ -1,0 +1,43 @@
+name: Automated Self-Learning Training Worker
+
+on:
+  repository_dispatch:
+    types: [run_calibration_training]
+  workflow_dispatch:
+
+jobs:
+  train-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install System Dependencies (libGL for OpenCV)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
+
+      - name: Install Python AI Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ultralytics>=8.4.0 boto3 opencv-python-headless requests
+
+      - name: Execute Automated Self-Learning Fine-Tuning
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || 'ad7567bc6207096d4bad4857b406dd1b' }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID || '18878903125e36ddfb5da4e4f9211b29' }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY || '9f9821d954b6e6ea6cfbca24285a97125668992dd419928f78552ac68754e831' }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'doctortool-ocr-models' }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL || 'https://pub-8b3cc4a8d5ff4365b18471f08bb797cb.r2.dev' }}
+          HEROKU_BASE_URL: ${{ secrets.HEROKU_BASE_URL || 'https://doctortool-ocr-orchestrator-d7500d9b91a8.herokuapp.com' }}
+          WORKER_SHARED_SECRET: ${{ secrets.WORKER_SHARED_SECRET || 'doctortool-colab-worker-secret-2026' }}
+        run: |
+          python train_worker.py
